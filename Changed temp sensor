@@ -1,0 +1,172 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// 핀 설정
+#define ONE_WIRE_BUS 2    // DS18B20 데이터 핀
+#define HEATER_PIN   3    // 가열 장치 제어 핀
+#define COOLER_PIN   4    // 펠티어 MOSFET 제어 핀
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// 실험 상태 정의
+enum State {
+  HEATING,
+  COOLING,
+  STOPPED
+};
+
+State currentState = HEATING;
+
+// 데이터 기록 구조체 (아두이노 SRAM 제약을 고려해 최대 150개 저장)
+struct DataPoint {
+  unsigned long timeSec;
+  float temp;
+};
+
+const int MAX_DATA_POINTS = 150;
+DataPoint dataLog[MAX_DATA_POINTS];
+int dataCount = 0;
+
+// 제어 및 타이밍 변수
+unsigned long startTime = 0;
+unsigned long lastLogTime = 0;
+const unsigned long LOG_INTERVAL = 2000; // 2초 간격 측정
+
+int targetReachedIndex = -1; // 냉각 후 최초 25도 이하 도달 인덱스
+
+void setup() {
+  Serial.begin(9600);
+  
+  pinMode(HEATER_PIN, OUTPUT);
+  pinMode(COOLER_PIN, OUTPUT);
+  
+  // 초기 안전 상태 (전원 차단)
+  digitalWrite(HEATER_PIN, LOW);
+  digitalWrite(COOLER_PIN, LOW);
+
+  sensors.begin();
+  
+  Serial.println(F("=== 알루미늄 블록 온도 제어 및 냉각 실험 시작 ==="));
+  Serial.println(F("실험 중단을 원하시면 시리얼 모니터에 아무 키나 입력 후 Enter를 누르세요.\n"));
+  
+  startTime = millis();
+  
+  // 1단계: 가열 시작
+  digitalWrite(HEATER_PIN, HIGH);
+  Serial.println(F("[1단계] 가열을 시작합니다. (목표: 90도)"));
+}
+
+void loop() {
+  // 4. 시리얼 입력 감지 시 실험 종료 및 데이터 출력
+  if (Serial.available() > 0) {
+    while (Serial.available() > 0) Serial.read(); // 버퍼 비우기
+    stopExperiment();
+    return;
+  }
+
+  if (currentState == STOPPED) return;
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastLogTime >= LOG_INTERVAL) {
+    lastLogTime = currentMillis;
+
+    sensors.requestTemperatures();
+    float currentTemp = sensors.getTempCByIndex(0);
+
+    if (currentTemp == DEVICE_DISCONNECTED_C) {
+      Serial.println(F("오류: DS18B20 센서 연결을 확인하세요."));
+      return;
+    }
+
+    unsigned long elapsedTime = (currentMillis - startTime) / 1000;
+
+    // 데이터 저장
+    if (dataCount < MAX_DATA_POINTS) {
+      dataLog[dataCount].timeSec = elapsedTime;
+      dataLog[dataCount].temp = currentTemp;
+      dataCount++;
+    }
+
+    // 2. 90도 달성 시 냉각 전환
+    if (currentState == HEATING) {
+      if (currentTemp >= 90.0) {
+        currentState = COOLING;
+        digitalWrite(HEATER_PIN, LOW);   // 가열 차단
+        digitalWrite(COOLER_PIN, HIGH);  // MOSFET 동작 (펠티어 가동)
+        Serial.println(F("\n[2단계] 90도 도달! 가열 중단 및 펠티어 냉각 장치 가동."));
+      }
+    } 
+    // 3. 냉각 후 최초 25도 이하 도달 지점 기록
+    else if (currentState == COOLING) {
+      if (currentTemp <= 25.0 && targetReachedIndex == -1) {
+        targetReachedIndex = dataCount - 1;
+        Serial.print(F("\n[3단계 달성] 최초 25도 이하 도달! (경과시간: "));
+        Serial.print(elapsedTime);
+        Serial.println(F("초)\n"));
+      }
+    }
+
+    // 모니터링 출력
+    Serial.print(F("시간: "));
+    Serial.print(elapsedTime);
+    Serial.print(F("s | 현재 온도: "));
+    Serial.print(currentTemp, 2);
+    Serial.print(F(" °C | 상태: "));
+    if (currentState == HEATING) Serial.println(F("가열 중"));
+    else if (currentState == COOLING) Serial.println(F("냉각 중"));
+  }
+}
+
+// 실험 종료 및 전원 차단 함수
+void stopExperiment() {
+  digitalWrite(HEATER_PIN, LOW);
+  digitalWrite(COOLER_PIN, LOW);
+  currentState = STOPPED;
+
+  Serial.println(F("\n========================================"));
+  Serial.println(F("사용자 명령 수신: 실험을 중단합니다."));
+  Serial.println(F("모든 장치(가열기 및 펠티어) 전원 차단 완료."));
+  Serial.println(F("========================================\n"));
+
+  printResults();
+}
+
+// 데이터 요약 및 시각화 출력 함수
+void printResults() {
+  Serial.println(F("--- [실험 결과 요약] ---"));
+  if (targetReachedIndex != -1) {
+    Serial.print(F("★ 25도 이하 최초 도달 시점: "));
+    Serial.print(dataLog[targetReachedIndex].timeSec);
+    Serial.print(F("초 (측정 온도: "));
+    Serial.print(dataLog[targetReachedIndex].temp, 2);
+    Serial.println(F(" °C)\n"));
+  } else {
+    Serial.println(F("※ 25도 이하에 도달하기 전 실험이 중단되었습니다.\n"));
+  }
+
+  // 아스키(ASCII) 그래프 출력 (과정 3 지점 표시)
+  Serial.println(F("--- [시간-온도 시각화 그래프 (0~100°C)] ---"));
+  for (int i = 0; i < dataCount; i++) {
+    if (dataLog[i].timeSec < 10) Serial.print(F(" "));
+    if (dataLog[i].timeSec < 100) Serial.print(F(" "));
+    Serial.print(dataLog[i].timeSec);
+    Serial.print(F("s ["));
+    
+    int barLength = map((int)constrain(dataLog[i].temp, 0, 100), 0, 100, 0, 40);
+    for (int j = 0; j < barLength; j++) {
+      Serial.print(F("*"));
+    }
+    for (int j = barLength; j < 40; j++) {
+      Serial.print(F(" "));
+    }
+    Serial.print(F("] "));
+    Serial.print(dataLog[i].temp, 1);
+    Serial.print(F(" °C"));
+
+    if (i == targetReachedIndex) {
+      Serial.print(F("  <-- [★ 과정3: 25도 도달 지점]"));
+    }
+    Serial.println();
+  }
+}
