@@ -1,0 +1,219 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// 회로 배치표 기준 핀 설정
+#define ONE_WIRE_BUS  2    // DS18B20 DATA 핀 (4.7kΩ 풀업 저항)
+#define HEATER_MOSFET 3    // 가열기 MOSFET SIG 핀
+#define COOLER_MOSFET 4    // 펠티어 MOSFET SIG 핀
+
+// 목표 온도 및 오차 범위 설정
+const float TARGET_HEAT_TEMP = 90.0;
+const float HEAT_TOLERANCE   = 1.5;  // 88.5°C 이상 도달 시 냉각 전환
+
+const float TARGET_COOL_TEMP = 25.0;
+const float COOL_TOLERANCE   = 0.5;  // 25.5°C 이하 도달 시 과정 3 조건 성립
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// 실험 상태 정의
+enum State {
+  WAITING_TO_START, // 시작 대기 상태
+  HEATING,          // 가열 진행 상태
+  COOLING,          // 냉각 진행 상태
+  STOPPED           // 실험 종료 상태
+};
+
+State currentState = WAITING_TO_START;
+
+// 데이터 기록 구조체 (SRAM 용량 고려 최대 150개 저장)
+struct DataPoint {
+  float timeSec;
+  float temp;
+};
+
+const int MAX_DATA_POINTS = 150; 
+DataPoint dataLog[MAX_DATA_POINTS];
+int dataCount = 0;
+
+// 제어 및 타이밍 변수
+unsigned long startTime = 0;
+unsigned long lastLogTime = 0;
+const unsigned long LOG_INTERVAL = 200; // 0.2초 (200ms) 비동기 간격
+
+int targetReachedIndex = -1; // 25.5°C 이하 최초 도달 인덱스
+String inputBuffer = "";     // 시리얼 콘솔 입력 버퍼
+
+void setup() {
+  Serial.begin(9600);
+  
+  pinMode(HEATER_MOSFET, OUTPUT);
+  pinMode(COOLER_MOSFET, OUTPUT);
+  
+  // 초기 안전 상태 (모든 MOSFET OFF)
+  digitalWrite(HEATER_MOSFET, LOW);
+  digitalWrite(COOLER_MOSFET, LOW);
+
+  sensors.begin();
+  
+  // 10비트 해상도 설정 (정밀도 0.25°C) 및 비동기 측정 활성화
+  sensors.setResolution(10);
+  sensors.setWaitForConversion(false);
+  sensors.requestTemperatures(); 
+
+  Serial.println(F("=================================================="));
+  Serial.println(F("=== 알루미늄 블록 온도 제어 및 냉각 실험 시스템 ==="));
+  Serial.println(F("=================================================="));
+  Serial.println(F("▶ 가열을 시작하려면 시리얼 모니터에 'start'를 입력 후 Enter를 누르세요."));
+  Serial.println(F("▶ 실험 도중 중단하려면 'end'를 입력 후 Enter를 누르세요.\n"));
+}
+
+void loop() {
+  // 사용자의 시리얼 콘솔 입력 감지
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      inputBuffer.trim();
+      if (inputBuffer.length() > 0) {
+        // 시작 대기 상태에서 'start' 입력 시
+        if (currentState == WAITING_TO_START && inputBuffer.equalsIgnoreCase("start")) {
+          inputBuffer = "";
+          startExperiment();
+          return;
+        } 
+        // 진행 중 상태에서 'end' 입력 시
+        else if ((currentState == HEATING || currentState == COOLING) && inputBuffer.equalsIgnoreCase("end")) {
+          inputBuffer = "";
+          stopExperiment();
+          return;
+        }
+        inputBuffer = ""; // 기타 입력 초기화
+      }
+    } else {
+      inputBuffer += c;
+    }
+  }
+
+  // 시작 전이거나 종료된 경우 더 이상 실행하지 않음
+  if (currentState == WAITING_TO_START || currentState == STOPPED) return;
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastLogTime >= LOG_INTERVAL) {
+    lastLogTime = currentMillis;
+
+    // 비동기 이전 변환값 읽기 및 다음 변환 재요청
+    float currentTemp = sensors.getTempCByIndex(0);
+    sensors.requestTemperatures();
+
+    if (currentTemp == DEVICE_DISCONNECTED_C || currentTemp < -50.0) {
+      Serial.println(F("오류: DS18B20 센서 연결(D2 핀)을 확인하세요."));
+      return;
+    }
+
+    float elapsedTime = (currentMillis - startTime) / 1000.0;
+
+    // 데이터 저장
+    if (dataCount < MAX_DATA_POINTS) {
+      dataLog[dataCount].timeSec = elapsedTime;
+      dataLog[dataCount].temp = currentTemp;
+      dataCount++;
+    }
+
+    // 2단계: 가열 중 88.5°C 이상 달성 시 냉각 전환
+    if (currentState == HEATING) {
+      if (currentTemp >= (TARGET_HEAT_TEMP - HEAT_TOLERANCE)) {
+        currentState = COOLING;
+        digitalWrite(HEATER_MOSFET, LOW);   // 가열기 차단 (D3 LOW)
+        digitalWrite(COOLER_MOSFET, HIGH);  // 펠티어 동작 (D4 HIGH)
+        Serial.println(F("\n[2단계] 가열 목표 도달(88.5°C 이상)! 가열기(D3) OFF / 펠티어(D4) ON"));
+      }
+    } 
+    // 3단계: 냉각 중 25.5°C 이하 최초 도달 기록
+    else if (currentState == COOLING) {
+      if (currentTemp <= (TARGET_COOL_TEMP + COOL_TOLERANCE) && targetReachedIndex == -1) {
+        targetReachedIndex = dataCount - 1;
+        Serial.print(F("\n[3단계 달성] 최초 25.5°C 이하 도달! (경과시간: "));
+        Serial.print(elapsedTime, 1);
+        Serial.println(F("초)\n"));
+      }
+    }
+
+    // 실시간 상태 출력
+    Serial.print(F("시간: "));
+    Serial.print(elapsedTime, 1);
+    Serial.print(F("s | 현재 온도: "));
+    Serial.print(currentTemp, 2);
+    Serial.print(F(" °C | 상태: "));
+    if (currentState == HEATING) Serial.println(F("가열 중 (D3 HIGH)"));
+    else if (currentState == COOLING) Serial.println(F("냉각 중 (D4 HIGH)"));
+  }
+}
+
+// 실험 시작 함수
+void startExperiment() {
+  currentState = HEATING;
+  startTime = millis(); // 시작 명령 입력 순간부터 타이머 시작
+  lastLogTime = millis();
+  
+  digitalWrite(HEATER_MOSFET, HIGH); // 가열 시작 (D3 HIGH)
+
+  Serial.println(F("\n========================================"));
+  Serial.println(F("▶ 'start' 명령 수신: 가열 및 측정 개시!"));
+  Serial.println(F("[1단계] 가열 MOSFET 동작 (핀 D3: HIGH / 목표: 90.0°C ± 1.5°C)"));
+  Serial.println(F("========================================\n"));
+}
+
+// 실험 종료 및 전원 차단 함수
+void stopExperiment() {
+  // 모든 MOSFET 제어 핀 차단 (전원 차단)
+  digitalWrite(HEATER_MOSFET, LOW);
+  digitalWrite(COOLER_MOSFET, LOW);
+  currentState = STOPPED;
+
+  Serial.println(F("\n========================================"));
+  Serial.println(F("▶ 'end' 명령 수신: 실험을 종료합니다."));
+  Serial.println(F("가열기(D3) 및 펠티어(D4) MOSFET 전원 차단 완료."));
+  Serial.println(F("========================================\n"));
+
+  printResults();
+}
+
+// 결과 분석 및 시각화 그래프 출력 함수
+void printResults() {
+  Serial.println(F("--- [실험 결과 요약] ---"));
+  if (targetReachedIndex != -1) {
+    Serial.print(F("★ 25.0°C (±0.5°C 범위) 최초 도달 시점: "));
+    Serial.print(dataLog[targetReachedIndex].timeSec, 1);
+    Serial.print(F("초 (측정 온도: "));
+    Serial.print(dataLog[targetReachedIndex].temp, 2);
+    Serial.println(F(" °C)\n"));
+  } else {
+    Serial.println(F("※ 목표 냉각 온도(25.5°C 이하)에 도달하기 전 실험이 중단되었습니다.\n"));
+  }
+
+  // 시간-온도 시각화 그래프 출력
+  Serial.println(F("--- [시간-온도 시각화 그래프 (0~100°C)] ---"));
+  for (int i = 0; i < dataCount; i++) {
+    if (dataLog[i].timeSec < 10.0) Serial.print(F("  "));
+    else if (dataLog[i].timeSec < 100.0) Serial.print(F(" "));
+    Serial.print(dataLog[i].timeSec, 1);
+    Serial.print(F("s ["));
+    
+    int barLength = map((int)constrain(dataLog[i].temp, 0, 100), 0, 100, 0, 40);
+    for (int j = 0; j < barLength; j++) {
+      Serial.print(F("*"));
+    }
+    for (int j = barLength; j < 40; j++) {
+      Serial.print(F(" "));
+    }
+    Serial.print(F("] "));
+    Serial.print(dataLog[i].temp, 2);
+    Serial.print(F(" °C"));
+
+    // 과정 3 지점 표기
+    if (i == targetReachedIndex) {
+      Serial.print(F("  <-- [★ 과정3: 25°C 도달 지점]"));
+    }
+    Serial.println();
+  }
+}
