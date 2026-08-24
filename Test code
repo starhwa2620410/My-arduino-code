@@ -1,0 +1,338 @@
+/*
+ * ==========================================
+ *  Arduino 냉각 실험 제어 프로그램
+ * ==========================================
+ *
+ * [Arduino의 역할]
+ * 1. 가열장치 ON/OFF
+ * 2. 12V 펠티어 ON/OFF
+ * 3. 실험 시간 측정
+ *
+ * [온도 측정]
+ * - KDS-1031 PT 온도센서
+ * - MBL에서 별도로 측정
+ * - Arduino에는 온도센서가 연결되지 않음
+ *
+ * [실험 과정]
+ *
+ * ① Arduino 시작
+ *      ↓
+ *    가열 ON
+ *    펠티어 OFF
+ *
+ * ② MBL에서 90°C 확인
+ *      ↓
+ *    Arduino에 'C' 입력
+ *      ↓
+ *    가열 OFF
+ *    펠티어 ON
+ *      ↓
+ *    냉각 시간 측정 시작
+ *
+ * ③ MBL에서 25°C 이하 도달 확인
+ *      ↓
+ *    Arduino는 계속 작동
+ *
+ * ④ 실험자가 'S' 입력
+ *      ↓
+ *    가열 OFF
+ *    펠티어 OFF
+ *    실험 종료
+ *
+ * ==========================================
+ */
+
+
+// ------------------------------------------
+// 1. 핀 번호 설정
+// ------------------------------------------
+
+// 가열장치 MOSFET의 Gate에 연결된 Arduino 핀
+const int HEATER_PIN = 5;
+
+// 펠티어 MOSFET의 Gate에 연결된 Arduino 핀
+const int PELTIER_PIN = 6;
+
+
+// ------------------------------------------
+// 2. 실험 상태 정의
+// ------------------------------------------
+
+enum ExperimentState
+{
+  HEATING,    // 가열 중
+  COOLING,    // 냉각 중
+  FINISHED    // 실험 종료
+};
+
+
+// 현재 실험 상태
+ExperimentState currentState;
+
+
+// ------------------------------------------
+// 3. 시간 변수
+// ------------------------------------------
+
+// Arduino가 실험을 시작한 시각
+unsigned long experimentStartTime;
+
+// 90°C 도달 후 냉각을 시작한 시각
+unsigned long coolingStartTime;
+
+
+// ------------------------------------------
+// 4. Arduino 초기 설정
+// ------------------------------------------
+
+void setup()
+{
+  // 시리얼 통신 시작
+  Serial.begin(9600);
+
+
+  // MOSFET 제어 핀을 출력으로 설정
+  pinMode(HEATER_PIN, OUTPUT);
+  pinMode(PELTIER_PIN, OUTPUT);
+
+
+  // 안전을 위해 처음에는 모든 장치를 OFF
+  digitalWrite(HEATER_PIN, LOW);
+  digitalWrite(PELTIER_PIN, LOW);
+
+
+  // 시작 메시지
+  Serial.println("================================");
+  Serial.println(" Arduino 냉각 실험 시작");
+  Serial.println("================================");
+
+
+  // 실험 시작 시간 기록
+  experimentStartTime = millis();
+
+
+  // 초기 상태 = 가열
+  currentState = HEATING;
+
+
+  // 가열장치 ON
+  digitalWrite(HEATER_PIN, HIGH);
+
+
+  // 펠티어 OFF
+  digitalWrite(PELTIER_PIN, LOW);
+
+
+  Serial.println("현재 상태 : 가열");
+  Serial.println("가열장치 : ON");
+  Serial.println("펠티어 : OFF");
+
+  Serial.println();
+  Serial.println("MBL에서 KDS-1031의 온도를 확인하세요.");
+  Serial.println("90°C에 도달하면 'C'를 입력하세요.");
+  Serial.println("25°C 이후에도 Arduino는 계속 작동합니다.");
+  Serial.println("실험을 종료하려면 'S'를 입력하세요.");
+}
+
+
+// ------------------------------------------
+// 5. 메인 프로그램
+// ------------------------------------------
+
+void loop()
+{
+  /*
+   * Arduino는 계속 실행됩니다.
+   *
+   * 온도센서는 Arduino에 연결되어 있지 않으므로
+   * 온도에 따른 자동 판단은 하지 않습니다.
+   *
+   * 대신 시리얼 모니터에서 명령을 받습니다.
+   */
+
+
+  // 시리얼 입력이 있는지 확인
+  if (Serial.available() > 0)
+  {
+    // 입력된 문자 하나를 읽음
+    char command = Serial.read();
+
+
+    // --------------------------------------
+    // C 입력
+    // → 가열 종료
+    // → 냉각 시작
+    // --------------------------------------
+
+    if ((command == 'C' || command == 'c') &&
+        currentState == HEATING)
+    {
+      startCooling();
+    }
+
+
+    // --------------------------------------
+    // S 입력
+    // → 실험 종료
+    // --------------------------------------
+
+    else if ((command == 'S' || command == 's') &&
+             currentState == COOLING)
+    {
+      finishExperiment();
+    }
+  }
+
+
+  // 현재 상태에 따른 시간 표시
+  printTime();
+}
+
+
+// ------------------------------------------
+// 6. 냉각 시작 함수
+// ------------------------------------------
+
+void startCooling()
+{
+  // 현재 상태를 냉각으로 변경
+  currentState = COOLING;
+
+
+  // 가열장치 OFF
+  digitalWrite(HEATER_PIN, LOW);
+
+
+  // 펠티어 ON
+  digitalWrite(PELTIER_PIN, HIGH);
+
+
+  // 냉각 시작 시간을 기록
+  coolingStartTime = millis();
+
+
+  // 결과 출력
+  Serial.println();
+  Serial.println("================================");
+  Serial.println(" 냉각 시작");
+  Serial.println("================================");
+
+
+  Serial.println("가열장치 : OFF");
+  Serial.println("펠티어 : ON");
+
+
+  // 실험 시작 후 몇 초에 냉각을 시작했는지 출력
+  unsigned long coolingStartSeconds =
+    (coolingStartTime - experimentStartTime) / 1000;
+
+
+  Serial.print("냉각 시작 시각 : ");
+  Serial.print(coolingStartSeconds);
+  Serial.println(" 초");
+
+
+  Serial.println();
+  Serial.println("MBL에서 온도를 계속 측정하세요.");
+  Serial.println("25°C에 도달해도 Arduino는 종료하지 않습니다.");
+  Serial.println("실험을 종료하려면 'S'를 입력하세요.");
+}
+
+
+// ------------------------------------------
+// 7. 실험 종료 함수
+// ------------------------------------------
+
+void finishExperiment()
+{
+  // 상태를 종료로 변경
+  currentState = FINISHED;
+
+
+  // 모든 장치 OFF
+  digitalWrite(HEATER_PIN, LOW);
+  digitalWrite(PELTIER_PIN, LOW);
+
+
+  // 총 실험 시간 계산
+  unsigned long totalTime =
+    (millis() - experimentStartTime) / 1000;
+
+
+  // 총 냉각 시간 계산
+  unsigned long coolingTime =
+    (millis() - coolingStartTime) / 1000;
+
+
+  // 결과 출력
+  Serial.println();
+  Serial.println("================================");
+  Serial.println(" 실험 종료");
+  Serial.println("================================");
+
+
+  Serial.println("가열장치 : OFF");
+  Serial.println("펠티어 : OFF");
+
+
+  Serial.print("총 실험 시간 : ");
+  Serial.print(totalTime);
+  Serial.println(" 초");
+
+
+  Serial.print("총 냉각 시간 : ");
+  Serial.print(coolingTime);
+  Serial.println(" 초");
+
+
+  Serial.println();
+  Serial.println("Arduino의 장치 제어를 종료했습니다.");
+}
+
+
+// ------------------------------------------
+// 8. 시간 출력 함수
+// ------------------------------------------
+
+void printTime()
+{
+  // 1초 단위로 출력하기 위한 정적 변수
+  static unsigned long previousPrintTime = 0;
+
+
+  // 현재 시간
+  unsigned long currentTime = millis();
+
+
+  // 1초가 지났는지 확인
+  if (currentTime - previousPrintTime >= 1000)
+  {
+    previousPrintTime = currentTime;
+
+
+    // 실험 시작 이후 경과 시간
+    unsigned long totalSeconds =
+      (currentTime - experimentStartTime) / 1000;
+
+
+    Serial.print("실험 경과 시간 : ");
+    Serial.print(totalSeconds);
+    Serial.print(" s");
+
+
+    // 냉각 상태라면 냉각 시간도 출력
+    if (currentState == COOLING)
+    {
+      unsigned long coolingSeconds =
+        (currentTime - coolingStartTime) / 1000;
+
+
+      Serial.print(" | 냉각 시간 : ");
+      Serial.print(coolingSeconds);
+      Serial.print(" s");
+    }
+
+
+    Serial.println();
+  }
+}
