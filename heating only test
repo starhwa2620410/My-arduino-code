@@ -1,0 +1,127 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// 회로 배치표 기준 핀 설정
+#define ONE_WIRE_BUS  2    // DS18B20 DATA 핀 (10kΩ 풀업 저항)
+#define HEATER_MOSFET 3    // 가열기 MOSFET SIG 핀
+#define COOLER_MOSFET 4    // 펠티어 MOSFET SIG 핀 (테스트 모드에서는 미사용)
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+bool isHeating = false;
+String inputBuffer = "";
+
+unsigned long startTime = 0;
+unsigned long lastLogTime = 0;
+const unsigned long LOG_INTERVAL = 2000; // 2초 간격 가열 상태 출력
+
+void setup() {
+  Serial.begin(9600);
+  
+  pinMode(HEATER_MOSFET, OUTPUT);
+  pinMode(COOLER_MOSFET, OUTPUT);
+  
+  // 초기 안전 상태 (모든 MOSFET OFF)
+  digitalWrite(HEATER_MOSFET, LOW);
+  digitalWrite(COOLER_MOSFET, LOW);
+
+  // 센서 라이브러리 초기화 (센서가 없어도 오류로 멈추지 않음)
+  sensors.begin();
+  sensors.setResolution(12);
+  sensors.setWaitForConversion(false);
+
+  Serial.println(F("=================================================="));
+  Serial.println(F("===      가열 MOSFET 제어 수동 테스트 모드      ==="));
+  Serial.println(F("=================================================="));
+  Serial.println(F("▶ 'start' 입력 : 가열 시작 (HEATER MOSFET D3 HIGH)"));
+  Serial.println(F("▶ 'end'   입력 : 가열 중단 (HEATER MOSFET D3 LOW)"));
+  Serial.println(F("==================================================\n"));
+}
+
+void loop() {
+  // 시리얼 입력 처리
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      inputBuffer.trim();
+      if (inputBuffer.length() > 0) {
+        if (inputBuffer.equalsIgnoreCase("start")) {
+          startHeating();
+        } 
+        else if (inputBuffer.equalsIgnoreCase("end")) {
+          stopHeating();
+        } 
+        else {
+          Serial.println(F("[알림] 'start' 또는 'end'를 입력해 주세요."));
+        }
+        inputBuffer = "";
+      }
+    } else {
+      inputBuffer += c;
+    }
+  }
+
+  // 가열 작동 중 상태 출력
+  if (isHeating) {
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastLogTime >= LOG_INTERVAL) {
+      lastLogTime += LOG_INTERVAL;
+      float elapsedTime = (currentMillis - startTime) / 1000.0;
+
+      Serial.print(F("🔥 [가열 중] 경과 시간: "));
+      Serial.print(elapsedTime, 1);
+      Serial.print(F("초"));
+
+      // 온도 센서가 꽂혀 있는 경우 온도를 함께 표시 (없으면 생략)
+      float currentTemp = sensors.getTempCByIndex(0);
+      sensors.requestTemperatures();
+      if (currentTemp != DEVICE_DISCONNECTED_C && currentTemp > -50.0) {
+        Serial.print(F(" | 현재 온도: "));
+        Serial.print(currentTemp, 2);
+        Serial.print(F(" °C"));
+      }
+      Serial.println();
+    }
+  }
+}
+
+// 가열 시작 함수
+void startHeating() {
+  if (isHeating) {
+    Serial.println(F("[알림] 이미 가열이 진행 중입니다."));
+    return;
+  }
+
+  isHeating = true;
+  startTime = millis();
+  lastLogTime = startTime;
+
+  digitalWrite(HEATER_MOSFET, HIGH); // 가열기 MOSFET 전원 ON
+  digitalWrite(COOLER_MOSFET, LOW);  // 펠티어 전원 OFF
+
+  sensors.requestTemperatures();
+
+  Serial.println(F("\n========================================"));
+  Serial.println(F("▶ 'start' 명령 수신: 가열을 시작합니다!"));
+  Serial.println(F("가열 MOSFET 핀(D3): HIGH (전원 공급 중)"));
+  Serial.println(F("========================================\n"));
+}
+
+// 가열 중단 함수
+void stopHeating() {
+  if (!isHeating) {
+    Serial.println(F("[알림] 가열이 작동하고 있지 않습니다."));
+    return;
+  }
+
+  isHeating = false;
+
+  digitalWrite(HEATER_MOSFET, LOW); // 가열기 MOSFET 전원 OFF
+  digitalWrite(COOLER_MOSFET, LOW);
+
+  Serial.println(F("\n========================================"));
+  Serial.println(F("▶ 'end' 명령 수신: 가열을 중단합니다."));
+  Serial.println(F("가열 MOSFET 핀(D3): LOW (전원 차단 완료)"));
+  Serial.println(F("========================================\n"));
+}
