@@ -1,0 +1,303 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// 회로 배치표 기준 핀 설정 변경
+#define ONE_WIRE_BUS  2    // DS18B20 DATA 핀 (4.7kΩ 저항)
+#define HEATER_MOSFET 4    // 가열기 MOSFET SIG 핀 (D4)
+#define COOLER_MOSFET 7    // 펠티어 MOSFET SIG 핀 (D7)
+
+// 목표 온도 및 오차/안전 범주 설정
+const float TARGET_HEAT_TEMP = 90.0;
+const float HEAT_TOLERANCE   = 1.5;   // 88.5°C 이상 도달 시 가열 완료 조건
+
+const float TARGET_COOL_TEMP = 25.0;
+const float COOL_TOLERANCE   = 0.5;   // 25.5°C 이하 도달 시 냉각 완료 조건
+
+const float EMERGENCY_MAX_TEMP = 100.0; // 비상 과열 차단 온도 (100.0°C)
+const int REQUIRED_CONSECUTIVE = 3;     // 연속 도달 인정 횟수 (3회 = 6초간 유지)
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// 실험 상태 정의
+enum State {
+  WAITING_TO_START, // 시작 대기
+  HEATING,          // 가열 진행
+  COOLING,          // 냉각 진행
+  STOPPED           // 실험 종료
+};
+
+State currentState = WAITING_TO_START;
+
+// 메모리 최적화 데이터 배열 (350개 = 약 11분 40초 저장 가능)
+const int MAX_DATA_POINTS = 350; 
+uint16_t dataLog[MAX_DATA_POINTS];
+int dataCount = 0;
+
+// 제어 및 타이밍 변수
+unsigned long startTime = 0;
+unsigned long lastLogTime = 0;
+const unsigned long LOG_INTERVAL = 2000; // 측정 간격: 2초 (2000ms)
+
+// 연속 감지 검증용 변수
+int heatConsecutiveCount = 0;
+int coolConsecutiveCount = 0;
+
+// 25°C 최초 진입 지점 저장용 변수
+int candidateIndex = -1;
+float candidateTime = 0.0;
+float candidateTemp = 0.0;
+
+int targetReachedIndex = -1;
+float targetReachedTime = 0.0;
+float targetReachedTemp = 0.0;
+
+// 시리얼 입력 버퍼
+char inputCmd[10];
+byte cmdIndex = 0;
+
+void setup() {
+  Serial.begin(9600);
+  
+  pinMode(HEATER_MOSFET, OUTPUT);
+  pinMode(COOLER_MOSFET, OUTPUT);
+  
+  // 초기 안전 상태 (모든 MOSFET OFF)
+  digitalWrite(HEATER_MOSFET, LOW);
+  digitalWrite(COOLER_MOSFET, LOW);
+
+  sensors.begin();
+
+  Serial.println(F("=================================================="));
+  Serial.println(F("=== 알루미늄 블록 온도 제어 및 냉각 실험 시스템 ==="));
+  Serial.println(F("=================================================="));
+
+  // [센서 존재 확인]
+  int deviceCount = sensors.getDeviceCount();
+  if (deviceCount == 0) {
+    Serial.println(F("[오류] DS18B20 온도 센서를 찾을 수 없습니다!"));
+    Serial.println(F("▶ D2 핀 데이터 연결, VCC/GND 전원, 4.7kΩ 저항 연결을 점검하세요.\n"));
+  } else {
+    Serial.print(F("[확인] 온도 센서 정상 인식 완료 (감지된 센서: "));
+    Serial.print(deviceCount);
+    Serial.println(F("개)\n"));
+  }
+
+  // 최고 해상도(12비트) 설정
+  sensors.setResolution(12);
+  sensors.setWaitForConversion(false);
+
+  Serial.println(F("▶ 가열을 시작하려면 시리얼 모니터에 'start'를 입력 후 Enter를 누르세요."));
+  Serial.println(F("▶ 실험 도중 중단하려면 'end'를 입력 후 Enter를 누르세요.\n"));
+}
+
+void loop() {
+  // 시리얼 입력 처리
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (cmdIndex > 0) {
+        inputCmd[cmdIndex] = '\0';
+        
+        if (currentState == WAITING_TO_START && strcasecmp(inputCmd, "start") == 0) {
+          cmdIndex = 0;
+          startExperiment();
+          return;
+        } 
+        else if ((currentState == HEATING || currentState == COOLING) && strcasecmp(inputCmd, "end") == 0) {
+          cmdIndex = 0;
+          stopExperiment(false);
+          return;
+        }
+        cmdIndex = 0;
+      }
+    } else if (cmdIndex < sizeof(inputCmd) - 1) {
+      inputCmd[cmdIndex++] = c;
+    }
+  }
+
+  if (currentState == WAITING_TO_START || currentState == STOPPED) return;
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastLogTime >= LOG_INTERVAL) {
+    lastLogTime += LOG_INTERVAL;
+
+    float elapsedTime = (currentMillis - startTime) / 1000.0;
+
+    // 온도 센서 실측 데이터 직접 로드 (임의 설정값 불필요)
+    float currentTemp = sensors.getTempCByIndex(0);
+    sensors.requestTemperatures();
+
+    // 센서 연결 오류 감지
+    if (currentTemp == DEVICE_DISCONNECTED_C || currentTemp < -50.0) {
+      Serial.println(F("[경고] 센서 연결 오류! 안전을 위해 실험을 중단합니다."));
+      stopExperiment(true);
+      return;
+    }
+
+    // 경량화 데이터 저장 (온도 * 100)
+    if (dataCount < MAX_DATA_POINTS) {
+      dataLog[dataCount] = (uint16_t)(currentTemp * 100.0);
+      dataCount++;
+    }
+
+    // [안전 장치] 비상 과열 차단 (100.0°C)
+    if (currentTemp >= EMERGENCY_MAX_TEMP) {
+      Serial.println(F("\n[비상 경고] 온도가 과열 한계치(100.0°C)를 초과했습니다!"));
+      Serial.println(F("히터 및 냉각 장치의 전원을 즉시 차단하고 실험을 비상 종료합니다."));
+      stopExperiment(true);
+      return;
+    }
+
+    // 1. 가열 단계 (88.5°C 이상)
+    if (currentState == HEATING) {
+      if (currentTemp >= (TARGET_HEAT_TEMP - HEAT_TOLERANCE)) {
+        heatConsecutiveCount++;
+        if (heatConsecutiveCount >= REQUIRED_CONSECUTIVE) {
+          currentState = COOLING;
+          
+          digitalWrite(HEATER_MOSFET, LOW);   // 히터 OFF (D4)
+          digitalWrite(COOLER_MOSFET, HIGH);  // 펠티어 ON (D7)
+          
+          Serial.println(F("\n========================================"));
+          Serial.println(F("❄️ [냉각 시작] 가열 목표(88.5°C 이상) 3회 연속 달성!"));
+          Serial.println(F("히터 차단(D4 LOW) 및 펠티어 냉각(D7 HIGH) 가동 중..."));
+          Serial.println(F("========================================\n"));
+        }
+      } else {
+        heatConsecutiveCount = 0;
+      }
+    } 
+    // 2. 냉각 단계 (25.5°C 이하)
+    else if (currentState == COOLING) {
+      digitalWrite(HEATER_MOSFET, LOW);
+
+      if (currentTemp <= (TARGET_COOL_TEMP + COOL_TOLERANCE)) {
+        if (coolConsecutiveCount == 0) {
+          candidateIndex = dataCount - 1;
+          candidateTime = elapsedTime;
+          candidateTemp = currentTemp;
+        }
+        coolConsecutiveCount++;
+
+        if (coolConsecutiveCount >= REQUIRED_CONSECUTIVE && targetReachedIndex == -1) {
+          targetReachedIndex = candidateIndex;
+          targetReachedTime = candidateTime;
+          targetReachedTemp = candidateTemp;
+
+          Serial.print(F("\n[3단계 달성] 연속 3회 25.5°C 이하 감지 확인!"));
+          Serial.print(F(" (최초 진입 시점: "));
+          Serial.print(targetReachedTime, 1);
+          Serial.print(F("초, 온도: "));
+          Serial.print(targetReachedTemp, 2);
+          Serial.println(F(" °C)\n"));
+        }
+      } else {
+        coolConsecutiveCount = 0;
+        candidateIndex = -1;
+      }
+    }
+
+    // 실시간 상태 로그
+    Serial.print(F("시간: "));
+    Serial.print(elapsedTime, 1);
+    Serial.print(F("s | 현재 온도: "));
+    Serial.print(currentTemp, 2);
+    Serial.print(F(" °C"));
+
+    if (currentState == HEATING && heatConsecutiveCount > 0) {
+      Serial.print(F(" [가열 도달: "));
+      Serial.print(heatConsecutiveCount);
+      Serial.print(F("/3]"));
+    } else if (currentState == COOLING && coolConsecutiveCount > 0) {
+      Serial.print(F(" [냉각 도달: "));
+      Serial.print(coolConsecutiveCount);
+      Serial.print(F("/3]"));
+    }
+    Serial.println();
+  }
+}
+
+// 실험 시작 함수
+void startExperiment() {
+  dataCount = 0;
+  heatConsecutiveCount = 0;
+  coolConsecutiveCount = 0;
+  candidateIndex = -1;
+  targetReachedIndex = -1;
+  targetReachedTime = 0.0;
+  targetReachedTemp = 0.0;
+
+  sensors.requestTemperatures();
+  startTime = millis();
+  lastLogTime = startTime;
+
+  currentState = HEATING;
+  digitalWrite(HEATER_MOSFET, HIGH); // 가열 시작 (D4 HIGH)
+  digitalWrite(COOLER_MOSFET, LOW);  // 펠티어 OFF (D7 LOW)
+
+  Serial.println(F("\n========================================"));
+  Serial.println(F("▶ 'start' 명령 수신: 실험이 시작되었습니다!"));
+  Serial.println(F("🔥 [가열 시작] 가열 MOSFET (D4 HIGH) 가동 중..."));
+  Serial.println(F("========================================\n"));
+}
+
+// 실험 종료 함수
+void stopExperiment(bool isEmergency) {
+  digitalWrite(HEATER_MOSFET, LOW); // 히터 OFF (D4)
+  digitalWrite(COOLER_MOSFET, LOW); // 펠티어 OFF (D7)
+  currentState = STOPPED;
+
+  Serial.println(F("\n========================================"));
+  if (isEmergency) {
+    Serial.println(F("▶ [비상 중단] 안전 장치(100°C) 작동으로 실험이 비상 중단되었습니다."));
+  } else {
+    Serial.println(F("▶ [실험 종료] 사용자의 'end' 명령 수신으로 실험이 종료되었습니다."));
+  }
+  Serial.println(F("가열기(D4) 및 펠티어(D7) MOSFET 전원 차단 완료."));
+  Serial.println(F("========================================\n"));
+
+  printResults();
+}
+
+// CSV 파일 내보내기 전용 결과 출력 함수
+void printResults() {
+  Serial.println(F("=================================================="));
+  Serial.println(F("===                실험 결과 요약               ==="));
+  Serial.println(F("=================================================="));
+  
+  if (targetReachedIndex != -1) {
+    Serial.print(F("★ 25.0°C (±0.5°C 범위) 연속 진입 최초 시점: "));
+    Serial.print(targetReachedTime, 1);
+    Serial.print(F("초 (최초 측정 온도: "));
+    Serial.print(targetReachedTemp, 2);
+    Serial.println(F(" °C)\n"));
+  } else {
+    Serial.println(F("※ 목표 냉각 온도(25.5°C 이하) 연속 도달 전 실험이 중단되었습니다.\n"));
+  }
+
+  // 엑셀/CSV 추출을 위한 표준 CSV 블록
+  Serial.println(F("=== [CSV DATA START] ==="));
+  Serial.println(F("Time(s),Temperature(C),Note"));
+
+  for (int i = 0; i < dataCount; i++) {
+    float timeSec = i * (LOG_INTERVAL / 1000.0);
+    float temp = dataLog[i] / 100.0;
+
+    Serial.print(timeSec, 1);
+    Serial.print(F(","));
+    Serial.print(temp, 2);
+    Serial.print(F(","));
+
+    if (i == targetReachedIndex) {
+      Serial.print(F("25C_Target_Reached"));
+    } else {
+      Serial.print(F("-"));
+    }
+    Serial.println();
+  }
+  Serial.println(F("=== [CSV DATA END] ===\n"));
+  Serial.println(F("💡 사용 방법: '=== [CSV DATA START] ===' 하단의 데이터 전체를 드래그하여"));
+  Serial.println(F("   엑셀에 붙여넣기하거나, 메모장에 붙여넣고 '.csv'로 저장하면 정밀 그래프를 생성할 수 있습니다."));
+  Serial.println(F("=================================================="));
+}
