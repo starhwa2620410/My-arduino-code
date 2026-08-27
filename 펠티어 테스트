@@ -1,0 +1,91 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// 핀 및 제어 신호 설정
+#define ONE_WIRE_BUS  2    // DS18B20 DATA 핀 (4.7kΩ 저항 사용)
+#define COOLER_MOSFET 7    // 펠티어 MOSFET SIG 핀 (D7)
+
+// MOSFET 모듈 신호 정의 (HIGH = ON)
+#define PELTIER_ON  HIGH   
+#define PELTIER_OFF LOW    
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+bool isTesting = false;
+unsigned long lastLogTime = 0;
+const unsigned long LOG_INTERVAL = 1000; // 1초 간격 실시간 출력
+
+char inputCmd[10];
+byte cmdIndex = 0;
+
+void setup() {
+  Serial.begin(9600);
+  
+  pinMode(COOLER_MOSFET, OUTPUT);
+  digitalWrite(COOLER_MOSFET, PELTIER_OFF); // 초기 상태 OFF
+
+  sensors.begin();
+  sensors.setResolution(12);
+
+  Serial.println(F("=================================================="));
+  Serial.println(F("===        펠티어 소자 단독 테스트 프로그램        ==="));
+  Serial.println(F("=================================================="));
+  
+  int deviceCount = sensors.getDeviceCount();
+  if (deviceCount == 0) {
+    Serial.println(F("[주의] 온도 센서가 감지되지 않았습니다. 핀 연결을 점검하세요."));
+  } else {
+    Serial.println(F("[확인] 온도 센서 연결 정상."));
+  }
+
+  Serial.println(F("▶ 'start' 입력 시 펠티어 가동 및 실시간 온도 측정 시작"));
+  Serial.println(F("▶ 'end'   입력 시 펠티어 전원 차단 및 테스트 종료\n"));
+}
+
+void loop() {
+  // 시리얼 입력 처리 ('start', 'end')
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (cmdIndex > 0) {
+        inputCmd[cmdIndex] = '\0';
+        
+        if (strcasecmp(inputCmd, "start") == 0) {
+          isTesting = true;
+          digitalWrite(COOLER_MOSFET, PELTIER_ON); // 펠티어 ON (D7 HIGH)
+          
+          Serial.println(F("\n========================================"));
+          Serial.println(F("❄️ [펠티어 ON] 테스트를 시작합니다."));
+          Serial.println(F("========================================\n"));
+        } 
+        else if (strcasecmp(inputCmd, "end") == 0) {
+          isTesting = false;
+          digitalWrite(COOLER_MOSFET, PELTIER_OFF); // 펠티어 OFF (D7 LOW)
+          
+          Serial.println(F("\n========================================"));
+          Serial.println(F("🛑 [펠티어 OFF] 전원을 차단하고 테스트를 종료합니다."));
+          Serial.println(F("========================================\n"));
+        }
+        cmdIndex = 0;
+      }
+    } else if (cmdIndex < sizeof(inputCmd) - 1) {
+      inputCmd[cmdIndex++] = c;
+    }
+  }
+
+  // 테스트 진행 중일 때 실시간 온도 모니터링
+  if (isTesting) {
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastLogTime >= LOG_INTERVAL) {
+      lastLogTime = currentMillis;
+
+      sensors.requestTemperatures();
+      float currentTemp = sensors.getTempCByIndex(0);
+
+      Serial.print(F("상태: 펠티어 가동 중 [D7 HIGH] | 현재 온도: "));
+      Serial.print(currentTemp, 2);
+      Serial.println(F(" °C"));
+    }
+  }
+}
