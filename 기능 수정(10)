@@ -6,8 +6,8 @@
 #define COOLER_MOSFET 7    // 펠티어 MOSFET SIG 핀 (D7)
 
 // MOSFET 모듈 신호 정의 (일반 N-Ch MOSFET 기준 HIGH = ON)
-#define PELTIER_ON  HIGH   
-#define PELTIER_OFF LOW    
+#define PELTIER_ON  LOW 
+#define PELTIER_OFF HIGH   
 
 // 목표 온도 설정
 const float TARGET_COOL_START_TEMP = 80.0; // 냉각 시작 감지 온도 (80.0°C)
