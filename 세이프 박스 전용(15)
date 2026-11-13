@@ -6,7 +6,7 @@
 #define COOLER_MOSFET 7    // 펠티어 MOSFET SIG 핀 (D7)
 #define BUZZER_PIN    11   // ALP1205S 부저 핀 (D11)
 
-// Active LOW 방식 MOSFET 모듈 반영 (LOW = 0V일 때 펠티어 가동)
+// Active LOW 방식 반영 (LOW = 0V일 때 펠티어 가동)
 #define PELTIER_ON  LOW   
 #define PELTIER_OFF HIGH  
 
@@ -18,7 +18,7 @@ const float EMERGENCY_MAX_TEMP     = 100.0; // 비상 과열 차단 온도 (100.
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
-// 실험 상태 정의
+// 실험 상태 정의 - 온도 센서의 측정값에 따라 실험 상태가 바뀔 것임
 enum State {
   WAITING_TO_START, // 시작 명령 대기
   WAITING_FOR_60C,  // 60°C 도달 대기
@@ -34,7 +34,7 @@ unsigned long startTime = 0;
 unsigned long lastLogTime = 0;
 const unsigned long LOG_INTERVAL = 2000; // 측정 간격: 2초 (2000ms)
 
-// 부저 비동기 제어 변수 (울림 시간 1초로 축소)
+// 부저 제어 변수 (울림 시간 1초)
 bool isBuzzerActive = false;
 unsigned long buzzerStartTime = 0;
 const unsigned long BUZZER_DURATION = 1000; // 60°C 도달 시 부저 울림 시간: 1초 (1000ms)
@@ -43,7 +43,7 @@ const unsigned long BUZZER_DURATION = 1000; // 60°C 도달 시 부저 울림 �
 char inputCmd[10];
 byte cmdIndex = 0;
 
-// 함수 선언
+// 함수 선언 - 부저 울리기 / 부저 테스트 / 아두이노 테스트 / 실험 시작 / 실험 중단, 총 5개
 void triggerBuzzer();
 void testBuzzerDiagnostic();
 void testPeltier();
@@ -93,14 +93,14 @@ void setup() {
 }
 
 void loop() {
-  // 부저 1초 울림 비동기 타이머 차단 제어
+  // 부저 1초 울림 후 타이머 차단 제어
   if (isBuzzerActive && (millis() - buzzerStartTime >= BUZZER_DURATION)) {
     noTone(BUZZER_PIN);
     digitalWrite(BUZZER_PIN, LOW);
     isBuzzerActive = false;
   }
 
-  // 시리얼 입력 처리 ('start', 'end', 'test')
+  // 시리얼 모니터(실험 중 텍스트로 명령 내릴 수 있는 곳) 입력 처리 ('start', 'end', 'test')
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
@@ -109,17 +109,17 @@ void loop() {
         
         if (currentState == WAITING_TO_START && strcasecmp(inputCmd, "test") == 0) {
           cmdIndex = 0;
-          testPeltier();
+          testPeltier();   // 시리얼 모니터에 'test' 입력 시 펠티어 소자 테스트(실험 시작 전)
           return;
         }
         else if (currentState == WAITING_TO_START && strcasecmp(inputCmd, "start") == 0) {
           cmdIndex = 0;
-          startExperiment();
+          startExperiment();   // 시리얼 모니터에 'start' 입력 시 실험 시작
           return;
         } 
         else if ((currentState == WAITING_FOR_60C || currentState == COOLING) && strcasecmp(inputCmd, "end") == 0) {
           cmdIndex = 0;
-          stopExperiment(false);
+          stopExperiment(false);  // 실험 시작 후 모니터에 'end' 입력 시 실험 종료
           return;
         }
         cmdIndex = 0;
@@ -139,7 +139,7 @@ void loop() {
 
     // 실시간 온도 측정
     sensors.requestTemperatures();
-    float currentTemp = sensors.getTempCByIndex(0);
+    float currentTemp = sensors.getTempCByIndex(0);  // 온도 센서의 측정값을 currentTemp로 받음(펠티어 작동 등의 기준이 됨)
 
     if (currentTemp == DEVICE_DISCONNECTED_C || currentTemp < -50.0) {
       Serial.println(F("[경고] 센서 연결 오류! 안전을 위해 실험을 중단합니다."));
@@ -154,21 +154,21 @@ void loop() {
       return;
     }
 
-    // 1. 60.0°C 도달 대기 과정
+    // 1. 60.0°C 도달 대기 중
     if (currentState == WAITING_FOR_60C) {
       digitalWrite(COOLER_MOSFET, PELTIER_OFF);
 
-      if (currentTemp >= TARGET_COOL_START_TEMP) {
-        currentState = COOLING;
+      if (currentTemp >= TARGET_COOL_START_TEMP) { 
+        currentState = COOLING;    // 현재 온도가 냉각 시작 온도(60도) 도달 시 냉각 시작
         digitalWrite(COOLER_MOSFET, PELTIER_ON);
-        triggerBuzzer(); // 🔔 60°C 도달 시 1초간 부저 작동
+        triggerBuzzer(); // 60°C 최초 도달 시 1초간 부저 작동
       }
     } 
     // 2. 냉각 진행 과정 (60°C -> 25°C)
     else if (currentState == COOLING) {
-      digitalWrite(COOLER_MOSFET, PELTIER_ON);
+      digitalWrite(COOLER_MOSFET, PELTIER_ON);  // 펠티어 가동 시작
 
-      if (currentTemp <= TARGET_COOL_TEMP) {
+      if (currentTemp <= TARGET_COOL_TEMP) {   // 현재 온도가 목표 냉각 온도(25도) 이하 도달 시 실험 종료
         Serial.print((long)elapsedTime);
         Serial.print(F(" ; "));
         Serial.print(currentTemp, 2);
